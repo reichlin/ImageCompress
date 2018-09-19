@@ -10,36 +10,26 @@ tf.reset_default_graph()
 
 def _parse_function(example_proto):
     keys_to_features = {'image/encoded': tf.VarLenFeature(tf.string),
-                        'image/filename': tf.FixedLenFeature([], tf.string)}
+                        'image/label': tf.VarLenFeature(tf.string)}
     parsed_features = tf.parse_example(example_proto, keys_to_features)
-    raw = tf.sparse_tensor_to_dense(parsed_features['image/encoded'], default_value="0", )
+    raw1 = tf.sparse_tensor_to_dense(parsed_features['image/encoded'], default_value="0", )
+    raw2 = tf.sparse_tensor_to_dense(parsed_features['image/label'], default_value="0", )
 
-    filenames = parsed_features['image/filename']
-
-    return (tf.map_fn(decode_random_crop, tf.squeeze(raw), dtype=tf.uint8, back_prop=False), filenames)
-
-
-def decode_random_crop(raw):
-    img = tf.image.decode_jpeg(raw, channels=3)
-
-    return tf.random_crop(img, [160, 160, 3])
+    return (tf.map_fn(decode, tf.squeeze(raw1), dtype=tf.uint8, back_prop=False),
+            tf.map_fn(decode, tf.squeeze(raw2), dtype=tf.uint8, back_prop=False))
 
 
-def get_train_dataset():
-    files = tf.data.Dataset.list_files("/mnt/disks/disk2/records/train/train-*")
-    dataset = files.interleave(tf.data.TFRecordDataset, cycle_length=1)
-    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(30))
-    dataset = dataset.shuffle(3500).repeat()
-    dataset = dataset.map(_parse_function)
-    dataset = dataset.prefetch(30)
-
-    return dataset
+def decode(raw):
+    return tf.image.decode_jpeg(raw, channels=3)
 
 
-def get_test_dataset():
-    files = tf.data.Dataset.list_files("/path/to/validation/validation-*")
-    dataset = files.interleave(tf.data.TFRecordDataset, cycle_length=1)
-    dataset = dataset.batch(100).map(_parse_function)
+def get_train_dataset(path, batch_size):
+    files = tf.data.Dataset.list_files(path)
+    dataset = files.apply(tf.contrib.data.parallel_interleave(tf.data.TFRecordDataset, cycle_length=4))
+    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(batch_size))
+    dataset = dataset.apply(tf.contrib.data.shuffle_and_repeat(20))
+    dataset = dataset.map(_parse_function, num_parallel_calls=4)
+    dataset = dataset.prefetch(batch_size)
 
     return dataset
 
@@ -171,16 +161,6 @@ def Mask(y, K):
     return m
 
 
-def soft_Q(z_masked, sigma, centroids, L):
-
-    zz = tf.transpose(tf.reshape(tf.tile(
-        tf.reshape(z_masked, [-1]), [L]), [L, tf.shape(z_masked)[0], tf.shape(z_masked)[1], tf.shape(z_masked)[2], tf.shape(z_masked)[3]]), [1, 2, 3, 4, 0])
-    cc = tf.reshape(tf.tile(centroids, [tf.size(z_masked)]), [tf.shape(z_masked)[0], tf.shape(z_masked)[1], tf.shape(z_masked)[2], tf.shape(z_masked)[3], L])
-    z_tilde = tf.reduce_sum(tf.nn.softmax(tf.abs(zz - cc) * (-sigma), axis=4) * cc, axis=4)
-
-    return z_tilde
-
-
 def Q(z_masked, centroids, L, z):
 
     zz = tf.transpose(tf.reshape(tf.tile(
@@ -210,36 +190,134 @@ def H(m, P, best_centroids, L, t_primo, beta, z):
 
     return tf.reduce_sum(tf.maximum(0.0, beta * (h - t_primo)))
 
+def getMSSSIM(x, x_hat):
 
-# dataset and iterator initialization
+    msssim_indexR = tf_ms_ssim(x[:, :, :, 0:1], x_hat[:, :, :, 0:1])
+    msssim_indexG = tf_ms_ssim(x[:, :, :, 1:2], x_hat[:, :, :, 1:2])
+    msssim_indexB = tf_ms_ssim(x[:, :, :, 2:3], x_hat[:, :, :, 2:3])
+    acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
 
-training_dataset = get_train_dataset()
-test_dataset = get_test_dataset()
+    return acc
 
-iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
-                                           training_dataset.output_shapes)
+def getAlpha(acc):
+
+    return 2000*((acc - 1)**2) + 5
+
+
+def discriminator(x, Dregularizer, DregularizerDense, batch_size, reuse_variables=None):
+
+    with tf.variable_scope(tf.get_variable_scope(), reuse=reuse_variables) as scope:
+        Dconv1 = tf.layers.conv2d(inputs=x,
+                                  filters=64,
+                                  kernel_size=[3, 3],
+                                  strides=(2, 2),
+                                  padding="same",
+                                  kernel_regularizer=Dregularizer,
+                                  name="Dconv1")
+
+        Dconv1 = tf.layers.batch_normalization(Dconv1)
+        Dconv1 = tf.nn.relu(Dconv1)
+
+        Dconv2 = tf.layers.conv2d(inputs=Dconv1,
+                                  filters=128,
+                                  kernel_size=[3, 3],
+                                  strides=(2, 2),
+                                  padding="same",
+                                  kernel_regularizer=Dregularizer,
+                                  name="Dconv2")
+
+        Dconv2 = tf.layers.batch_normalization(Dconv2)
+        Dconv2 = tf.nn.relu(Dconv2)
+
+        Dconv3 = tf.layers.conv2d(inputs=Dconv2,
+                                  filters=256,
+                                  kernel_size=[3, 3],
+                                  strides=(2, 2),
+                                  padding="same",
+                                  kernel_regularizer=Dregularizer,
+                                  name="Dconv3")
+
+        Dconv3 = tf.layers.batch_normalization(Dconv3)
+        Dconv3 = tf.nn.relu(Dconv3)
+
+        Dconv4 = tf.layers.conv2d(inputs=Dconv3,
+                                  filters=128,
+                                  kernel_size=[3, 3],
+                                  strides=(2, 2),
+                                  padding="same",
+                                  kernel_regularizer=Dregularizer,
+                                  name="Dconv4")
+
+        Dconv4 = tf.layers.batch_normalization(Dconv4)
+        Dconv4 = tf.nn.relu(Dconv4)
+
+        Dconv5 = tf.layers.conv2d(inputs=Dconv4,
+                                  filters=32,
+                                  kernel_size=[3, 3],
+                                  strides=(2, 2),
+                                  padding="same",
+                                  kernel_regularizer=Dregularizer,
+                                  name="Dconv5")
+
+        Dconv5 = tf.layers.batch_normalization(Dconv5)
+        Dconv5 = tf.nn.relu(Dconv5)
+
+        DconvOut = tf.reshape(Dconv5, [batch_size, -1])
+
+        Ddense1 = tf.layers.dense(inputs=DconvOut,
+                                  units=1024,
+                                  activation=tf.nn.relu,
+                                  # kernel_initializer=tf.contrib.layers.xavier_initializer,
+                                  kernel_regularizer=DregularizerDense,
+                                  name="Ddense1")
+
+        Ddense2 = tf.layers.dense(inputs=Ddense1,
+                                  units=512,
+                                  activation=tf.nn.relu,
+                                  # kernel_initializer=tf.contrib.layers.xavier_initializer,
+                                  kernel_regularizer=DregularizerDense,
+                                  name="Ddense2")
+
+        Dout = tf.layers.dense(inputs=Ddense2,
+                               units=1,
+                               activation=None,
+                               # kernel_initializer=tf.contrib.layers.xavier_initializer,
+                               kernel_regularizer=DregularizerDense,
+                               name="Dout")
+
+        return Dout
 
 # variables initialization ------------------------------------------------------------------------------------------------------------------
 
 # network hyper-parameter
-batch_size = 30
-epochs = 6
 
 t_primo = tf.constant(0.4)  # Clipping term for entropy
 sigma = tf.constant(1.)
 depth = 5  # Depth residual block for the AutoEncoder
-lr = tf.Variable(9e-5)  # Learning rate
 regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regularization term for all layers
 regularizer2 = tf.contrib.layers.l2_regularizer(scale=0.1)  # Regularization term for layer that outputs y
 image_height = 160
 image_width = 160
 
-k_ms_ssim = 5000
 
 K = 32
 n_centroids = 6
 beta = 500
 L = n_centroids
+
+
+# constanti
+Dregularizer = tf.contrib.layers.l2_regularizer(scale=0.001)
+DregularizerDense = tf.contrib.layers.l2_regularizer(scale=0.001)
+Gregularizer = tf.contrib.layers.l2_regularizer(scale=0.001)
+Ginitializer = tf.random_normal_initializer(stddev=0.00001)
+lrD = tf.Variable(5e-4, dtype=tf.float32)
+lrG = tf.Variable(5e-4, dtype=tf.float32)
+epochsD = 1
+epochsGAN = 10
+batch_size = 30
+
+
 
 mask_filter1 = tf.constant([[[[[1, 1, 1], [1, 1, 1], [1, 1, 1]], [[1, 1, 1], [1, 0, 0], [0, 0, 0]], [[0, 0, 0], [0, 0, 0], [0, 0, 0]]]]], dtype=tf.float32)
 mask_filter2 = tf.constant([[[[[1, 1, 1], [1, 1, 1], [1, 1, 1]], [[1, 1, 1], [1, 1, 0], [0, 0, 0]], [[0, 0, 0], [0, 0, 0], [0, 0, 0]]]]], dtype=tf.float32)
@@ -252,16 +330,25 @@ mask_filter2 = tf.reshape(tf.tile(mask_filter2, [1, 1, 1, 24, 24]), [3, 3, 3, 24
 mask_filter3 = tf.reshape(tf.tile(mask_filter3, [1, 1, 1, 24, L]), [3, 3, 3, 24, L])
 
 
+# dataset and iterator initialization
+
+dataset = get_train_dataset("/mnt/disks/disk2/ae_out/records/train/train-*", batch_size)
+
+iterator = tf.data.Iterator.from_structure(dataset.output_types,
+                                           dataset.output_shapes)
+
+with tf.device('/cpu:0'):
+    data = iterator.get_next()
+    x_ae = tf.reshape(tf.image.convert_image_dtype(data[0], dtype=tf.float32), [batch_size, 160, 160, 3])
+    x = tf.reshape(tf.image.convert_image_dtype(data[1], dtype=tf.float32), [batch_size, 160, 160, 3])
+
+
 # Graph definition ------------------------------------------------------------------------------------------------------------------
 
 # Network Placeholders
 training = tf.placeholder(dtype=tf.bool, shape=(), name="isTraining")
 file_path = tf.placeholder(tf.string, name="path")
 
-# Read input from pipeline
-with tf.device('/cpu:0'):
-    x = tf.reshape(tf.image.convert_image_dtype(iterator.get_next()[0], dtype=tf.float32), [batch_size, 160, 160, 3])
-    filenames = iterator.get_next()[1]
 
 # Encoder
 
@@ -367,12 +454,11 @@ y = tf.sigmoid(tf.nn.relu(y_out)) * K
 
 m = Mask(y, K)
 z_masked = tf.multiply(z, m)
-z_tilde = soft_Q(z_masked, sigma, centroids, L)
 z_hat, best_centroids = Q(z_masked, centroids, L, z)
-z_differentiable = tf.stop_gradient(z_hat - z_tilde) + z_tilde
+z_differentiable = tf.stop_gradient(z_hat)
 
 
-# Decoder
+# Decoder / Generator
 
 D_residual_blocks = []
 D_residual_blocks.append(tf.layers.conv2d_transpose(inputs=z_differentiable,
@@ -460,17 +546,10 @@ x_hat = deconv2
 
 # Normalize Reconstructed Image
 
-'''
-n_values_per_image = tf.size(x_hat[0, :, :, :])
-x_hat_flat = tf.reshape(x_hat, [batch_size, n_values_per_image])
-max_value = tf.transpose(tf.reshape(tf.tile(tf.reduce_max(x_hat_flat, axis=1), [n_values_per_image]), [3, image_height, image_width, batch_size]), [3, 2, 1, 0])
-min_value = tf.transpose(tf.reshape(tf.tile(tf.reduce_min(x_hat_flat, axis=1), [n_values_per_image]), [3, image_height, image_width, batch_size]), [3, 2, 1, 0])
-x_hat_norm = (x_hat - min_value) / (max_value - min_value)
-'''
+
 x_hat_norm = x_hat * tf.sqrt(var + 1e-10) + mean
 x_hat_norm = tf.clip_by_value(x_hat_norm, 0, 1.0)
 
-tf.summary.image("x_hat_norm", x_hat_norm, 5)
 
 # Context Model
 
@@ -494,43 +573,55 @@ conv4 = tf.nn.relu(tf.nn.bias_add(conv3d(conv3 + conv1, W_conv4), b_conv4))
 
 P = tf.nn.softmax(conv4)
 
-# Distortion rate index
-msssim_indexR = tf_ms_ssim(x[:, :, :, 0:1], x_hat_norm[:, :, :, 0:1])
-msssim_indexG = tf_ms_ssim(x[:, :, :, 1:2], x_hat_norm[:, :, :, 1:2])
-msssim_indexB = tf_ms_ssim(x[:, :, :, 2:3], x_hat_norm[:, :, :, 2:3])
-acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
-d = k_ms_ssim * (1 - acc)
-mse = (tf.reduce_sum(tf.square(x_hat_norm - x), axis=[1, 2, 3, 0]) / (128*batch_size))
-distortion_rate = tf.where(tf.is_nan(d), mse, d)
-tf.summary.scalar('accuracy', acc*100.)
-
-# Entropy
-h_context_model = H_context_model(P, best_centroids, L, t_primo, beta, z) / (400 * K)
-h = H(m, P, best_centroids, L, t_primo, beta, z) / (400 * K)
-tf.summary.scalar('entropy_context_model', h_context_model)
-tf.summary.scalar('entropy', h)
-
-# Total Loss
-loss = distortion_rate + (h + h_context_model) / (2. * batch_size)
-tf.summary.scalar('loss', loss)
 
 
-# Optimizer Context Model
-optimizer = tf.train.AdamOptimizer(learning_rate=lr)
 
+
+
+
+# Generator
+Gz = x_hat_norm
+s_gz = tf.summary.image("Gz", Gz, 1)
+s_x_ae = tf.summary.image("x_ae", x_ae, 1)
+s_x = tf.summary.image("x", x, 1)
+
+g_acc = getMSSSIM(x, Gz)
+ae_acc = getMSSSIM(x, x_ae)
+
+tf.summary.scalar('ms-ssim_G', g_acc)
+tf.summary.scalar('delta_ms-ssim', (g_acc - ae_acc))
+
+Dx = discriminator(x, Dregularizer, DregularizerDense, batch_size)
+
+Dg = discriminator(tf.stop_gradient(Gz), Dregularizer, DregularizerDense, batch_size, reuse_variables=True)
+
+# losses
+
+d_loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=Dx, labels=tf.ones_like(Dx)))
+d_loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=Dg, labels=tf.zeros_like(Dg)))
+d_loss = d_loss_real + d_loss_fake
+s_d_loss = tf.summary.scalar('loss_discriminator', d_loss)
+
+
+g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits=Dg, labels=tf.ones_like(Dg))) + g_acc * getAlpha(g_acc)
+tf.summary.scalar('loss_generator', g_loss)
+
+# Optimizers
+optimizer_D = tf.train.AdamOptimizer(learning_rate=lrD)
+optimizer_G = tf.train.AdamOptimizer(learning_rate=lrG)
 
 update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
 with tf.control_dependencies(update_ops):
-    train = optimizer.minimize(loss)
+    traind = optimizer_D.minimize(d_loss)
+    traing = optimizer_G.minimize(g_loss)
 
-# Graph initialization ------------------------------------------------------------------------------------------------------------------
-
-training_init_op = iterator.make_initializer(training_dataset)
+training_init_op1 = iterator.make_initializer(dataset)
 
 sess = tf.Session()
 
 merged = tf.summary.merge_all()
-train_writer = tf.summary.FileWriter('log/train', sess.graph)
+train_writer2 = tf.summary.FileWriter('log_gan/discriminator', sess.graph)
+train_writer3 = tf.summary.FileWriter('log_gan/adversarial', sess.graph)
 
 init1 = tf.global_variables_initializer()
 init2 = tf.local_variables_initializer()
@@ -541,31 +632,38 @@ saver = tf.train.Saver()
 
 # Model Training ------------------------------------------------------------------------------------------------------------------
 
-num_batch = 6616
-sess.run(training_init_op)
-for e in range(epochs):
-    print("epoch: " + str(e) + " of " + str(epochs))
+sess.run(training_init_op1)
+
+saver.restore(sess, '/mnt/disks/disk2/ae/model.*')
+
+# alleno discriminator da solo
+num_batch = 1000
+for e in range(epochsD):
+    print("epoch: " + str(e) + " of " + str(epochsD))
     for i in range(num_batch):
         age = e * num_batch + i
-        _, summary, dr = sess.run((train, merged, distortion_rate), feed_dict={training: True})
 
-        train_writer.add_summary(summary, age)
+        _, summary = sess.run((traind, s_d_loss))
+
+        train_writer2.add_summary(summary, age)
+
+# alleno GAN
+num_batch = 4968
+for e in range(epochsGAN):
+    print("epoch: " + str(e) + " of " + str(epochsGAN))
+    for i in range(num_batch):
+        age = e * num_batch + i
+
+        _, _, summary = sess.run((traind, traing, merged))  # forse anche g_acc
+
+        train_writer3.add_summary(summary, age)
 
     if e % 2 == 1:
-        lr = tf.assign(lr, lr * 0.1)
+        lrD = tf.assign(lrD, lrD * 0.5)
+        lrG = tf.assign(lrG, lrG * 0.5)
 
 try:
-    saver.save(sess, "/home/luca.marson1994/model/model.ckpt")
+    saver.save(sess, "/home/luca.marson1994/model/gan/model.ckpt")
     print("model saved successfully")
 except Exception:
     pass
-
-for i in range(num_batch):
-    fn, batch_img_out, batch_img = sess.run((filenames, x_hat_norm, x), feed_dict={training: True})
-
-    for j in range(len(fn)):
-        name = "/mnt/disks/disk2/ae_out/label/" + str(fn[j])[2:-1]
-        plt.imsave(name, batch_img[j])
-
-        name = "/mnt/disks/disk2/ae_out/in/" + str(fn[j])[2:-1]
-        plt.imsave(name, batch_img_out[j])
