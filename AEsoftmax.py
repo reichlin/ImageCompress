@@ -1,6 +1,5 @@
 import tensorflow as tf
 import numpy as np
-import matplotlib.pyplot as plt
 
 # reset graph
 tf.reset_default_graph()
@@ -9,26 +8,23 @@ tf.reset_default_graph()
 
 
 def _parse_function(example_proto):
-    keys_to_features = {'image/encoded': tf.VarLenFeature(tf.string),
-                        'image/filename': tf.FixedLenFeature([], tf.string)}
+    keys_to_features = {'image/encoded': tf.VarLenFeature(tf.string)}
     parsed_features = tf.parse_example(example_proto, keys_to_features)
     raw = tf.sparse_tensor_to_dense(parsed_features['image/encoded'], default_value="0", )
 
-    filenames = parsed_features['image/filename']
-
-    return (tf.map_fn(decode_random_crop, tf.squeeze(raw), dtype=tf.uint8, back_prop=False), filenames)
+    return (tf.map_fn(decode_random_crop, tf.squeeze(raw), dtype=tf.uint8, back_prop=False))
 
 
 def decode_random_crop(raw):
-    img = tf.image.decode_jpeg(raw, channels=3)
+    img = tf.image.decode_jpeg(raw, channels=3, try_recover_truncated=True, acceptable_fraction=0.5)
 
     return tf.random_crop(img, [160, 160, 3])
 
 
 def get_train_dataset():
-    files = tf.data.Dataset.list_files("/mnt/disks/disk2/records/train/train-*")
+    files = tf.data.Dataset.list_files("train/train-*")
     dataset = files.interleave(tf.data.TFRecordDataset, cycle_length=1)
-    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(30))
+    dataset = dataset.apply(tf.contrib.data.batch_and_drop_remainder(16))
     dataset = dataset.shuffle(3500).repeat()
     dataset = dataset.map(_parse_function)
     dataset = dataset.prefetch(30)
@@ -116,10 +112,6 @@ def tf_ms_ssim(img1, img2, mean_metric=True, level=5):
     return value
 
 
-
-
-
-
 # dataset and iterator initialization
 
 training_dataset = get_train_dataset()
@@ -131,19 +123,21 @@ iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
 # variables initialization ------------------------------------------------------------------------------------------------------------------
 
 # network hyper-parameter
-batch_size = 30
-epochs = 6
+batch_size = 16
+n_update = 20000 * 6
 
 sigma = tf.constant(1.)
-depth = 5  # Depth residual block for the AutoEncoder
-lr = tf.Variable(9e-5)  # Learning rate
-regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regularization term for all layers
+depth = 5 # Depth residual block for the AutoEncoder
+lr = tf.Variable(1e-5) # Learning rate
+regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regulapa/ui/rization term for all layers
 regularizer2 = tf.contrib.layers.l2_regularizer(scale=0.1)  # Regularization term for layer that outputs y
 image_height = 160
 image_width = 160
 
-K = 32
+beta = 100
 
+K = 128
+L = 256
 
 # Graph definition ------------------------------------------------------------------------------------------------------------------
 
@@ -153,8 +147,8 @@ file_path = tf.placeholder(tf.string, name="path")
 
 # Read input from pipeline
 with tf.device('/cpu:0'):
-    x = tf.reshape(tf.image.convert_image_dtype(iterator.get_next()[0], dtype=tf.float32), [batch_size, 160, 160, 3])
-    filenames = iterator.get_next()[1]
+    x = tf.reshape(tf.image.convert_image_dtype(iterator.get_next(), dtype=tf.float32), [batch_size, 160, 160, 3])
+    #filenames = iterator.get_next()[1]
 
 # Encoder
 
@@ -243,6 +237,14 @@ e_out = tf.layers.conv2d(inputs=tmp,
                          kernel_regularizer=regularizer,
                          name="conv"+str(depth*6+5))
 
+z = tf.layers.conv3d(inputs=tf.expand_dims(e_out, axis=-1),
+                     filters=L,
+                     kernel_size=[1, 1, 1],
+                     strides=(1, 1, 1),
+                     padding="same",
+                     kernel_regularizer=regularizer,
+                     name="conv3d")
+
 y_out = tf.layers.conv2d(inputs=tmp,
                          filters=1,
                          kernel_size=[5, 5],
@@ -251,21 +253,27 @@ y_out = tf.layers.conv2d(inputs=tmp,
                          #kernel_initializer=tf.constant_initializer(K),
                          kernel_regularizer=regularizer2,
                          name="conv"+str(depth * 6 + 6))
-z = e_out
 
+z_soft = tf.nn.softmax(z)
+z_hat = tf.cast(tf.argmax(z_soft, axis=-1) + 1, dtype=tf.float32)
 
-y = tf.exp(y_out)
+cs = tf.cumsum(tf.ones_like(z_soft), axis=-1)
+z_tilde = tf.reduce_sum(cs * tf.exp(beta * z_soft), axis=-1) / tf.reduce_sum(tf.exp(beta * z_soft), axis=-1)
+
+z_differentiable = tf.stop_gradient(z_hat - z_tilde) + z_tilde
+
+y = tf.exp(tf.layers.batch_normalization(inputs=y_out, training=training))
 sum = tf.reshape(tf.reduce_sum(y, axis=[1, 2]), [-1, 1])
 shape = tf.shape(y)
 tile = tf.tile(sum, [1, shape[1] * shape[2]])
+
 y = tf.div(y, tf.reshape(tile, shape))
 
-tf.summary.image("prob", y, 1)
+tf.summary.image("prob", y, 5)
 
 yy = tf.transpose(tf.reshape(tf.tile(tf.reshape(y, [-1]), [K]), [K, tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2]]), [1, 2, 3, 0])
 kk = tf.transpose(tf.reshape(tf.tile(tf.linspace(0., K-1, K), [np.prod(y.get_shape().as_list())]), [tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2], K]), [0, 1, 2, 3])
 m = yy * K - kk
-
 zero = tf.zeros(tf.shape(m))
 m = tf.maximum(x=m, y=zero)
 zero = tf.ones(tf.shape(m))
@@ -276,13 +284,13 @@ m = m + tf.stop_gradient(tf.ceil(m) - m)
 
 # Quantizer
 
-z_hat = tf.multiply(z, m)
+z_masked = tf.multiply(z_differentiable, m)
 
 
 # Decoder
 
 D_residual_blocks = []
-D_residual_blocks.append(tf.layers.conv2d_transpose(inputs=z_hat,
+D_residual_blocks.append(tf.layers.conv2d_transpose(inputs=z_masked,
                                                     filters=128,
                                                     kernel_size=[3, 3],
                                                     strides=(2, 2),
@@ -370,14 +378,17 @@ x_hat = deconv2
 x_hat_norm = x_hat * tf.sqrt(var + 1e-10) + mean
 x_hat_norm = tf.clip_by_value(x_hat_norm, 0, 1.0)
 
+tf.summary.image("x", x, 5)
 tf.summary.image("x_hat_norm", x_hat_norm, 5)
 
 # Distortion rate index
-msssim_indexR = tf_ms_ssim(x[:, :, :, 0:1], x_hat_norm[:, :, :, 0:1])
-msssim_indexG = tf_ms_ssim(x[:, :, :, 1:2], x_hat_norm[:, :, :, 1:2])
-msssim_indexB = tf_ms_ssim(x[:, :, :, 2:3], x_hat_norm[:, :, :, 2:3])
+# msssim_indexR = tf_ms_ssim(x[:, :, :, 0:1], x_hat_norm[:, :, :, 0:1])
+# msssim_indexG = tf_ms_ssim(x[:, :, :, 1:2], x_hat_norm[:, :, :, 1:2])
+# msssim_indexB = tf_ms_ssim(x[:, :, :, 2:3], x_hat_norm[:, :, :, 2:3])
+#
+# acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
 
-acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
+acc = tf.reduce_mean(tf.squared_difference(x, x_hat_norm))
 
 loss = (1 - acc)
 
@@ -411,31 +422,28 @@ saver = tf.train.Saver()
 
 # Model Training ------------------------------------------------------------------------------------------------------------------
 
-num_batch = 6616
+update = 0
 sess.run(training_init_op)
-for e in range(epochs):
-    print("epoch: " + str(e) + " of " + str(epochs))
-    for i in range(num_batch):
-        age = e * num_batch + i
-        _, summary = sess.run((train, merged), feed_dict={training: True})
+for update in range(n_update):
+    _, summary = sess.run((train, merged), feed_dict={training: True})
 
-        train_writer.add_summary(summary, age)
+    train_writer.add_summary(summary, update)
 
-    if e % 2 == 1:
+    if update % 40000 == 39999:
         lr = tf.assign(lr, lr * 0.1)
 
 try:
-    saver.save(sess, "/home/luca.marson1994/model/model.ckpt")
+    saver.save(sess, "model/model.ckpt")
     print("model saved successfully")
 except Exception:
     pass
-
-for i in range(num_batch):
-    fn, batch_img_out, batch_img = sess.run((filenames, x_hat_norm, x), feed_dict={training: True})
-
-    for j in range(len(fn)):
-        name = "/mnt/disks/disk2/ae_out/label/" + str(fn[j])[2:-1]
-        plt.imsave(name, batch_img[j])
-
-        name = "/mnt/disks/disk2/ae_out/in/" + str(fn[j])[2:-1]
-        plt.imsave(name, batch_img_out[j])
+#
+# for i in range(num_batch):
+#     fn, batch_img_out, batch_img = sess.run((filenames, x_hat_norm, x), feed_dict={training: True})
+# 
+#     for j in range(len(fn)):
+#         name = "/mnt/disks/disk2/ae_out/label/" + str(fn[j])[2:-1]
+#         plt.imsave(name, batch_img[j])
+#
+#         name = "/mnt/disks/disk2/ae_out/in/" + str(fn[j])[2:-1]
+#         plt.imsave(name, batch_img_out[j])

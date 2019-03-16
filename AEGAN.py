@@ -332,7 +332,7 @@ mask_filter3 = tf.reshape(tf.tile(mask_filter3, [1, 1, 1, 24, L]), [3, 3, 3, 24,
 
 # dataset and iterator initialization
 
-dataset = get_train_dataset("/mnt/disks/disk2/ae_out/records/train/train-*", batch_size)
+dataset = get_train_dataset("~/train/train-*", batch_size)
 
 iterator = tf.data.Iterator.from_structure(dataset.output_types,
                                            dataset.output_shapes)
