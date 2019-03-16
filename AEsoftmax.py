@@ -183,7 +183,7 @@ with tf.name_scope("Encoder"):
                              strides=(2, 2),
                              padding="same",
                              #kernel_initializer=tf.constant_initializer(K),
-                             kernel_regularizer=regularizer2,
+                             kernel_regularizer=regularizer,
                              name="conv"+str(depth * 6 + 6))
 
     #y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
