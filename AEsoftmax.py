@@ -56,22 +56,24 @@ iterator = tf.data.Iterator.from_structure(training_dataset.output_types,
 batch_size = 16
 n_update = 20000 * 6
 
-sigma = tf.constant(1.)
+#sigma = tf.constant(1.)
 depth = 5 # Depth residual block for the AutoEncoder
-lr = tf.Variable(1e-4) # Learning rate
+learning_rate = 1e-4 # Learning rate
 regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regulapa/ui/rization term for all layers
 regularizer2 = tf.contrib.layers.l2_regularizer(scale=0.1)  # Regularization term for layer that outputs y
+initializer = tf.initializers.he_normal()
 image_height = 160
 image_width = 160
 
 beta = 100
 
-K = 128
-L = 256
+K = 1024
+L = 64
 
 # Graph definition ------------------------------------------------------------------------------------------------------------------
 
 # Network Placeholders
+lr = tf.placeholder(shape=(), dtype=tf.float32)
 training = tf.placeholder(dtype=tf.bool, shape=(), name="isTraining")
 file_path = tf.placeholder(tf.string, name="path")
 
@@ -96,6 +98,7 @@ with tf.name_scope("Encoder"):
                              strides=(2, 2),
                              padding="same",
                              kernel_regularizer=regularizer,
+                             kernel_initializer=initializer,
                              name="conv1")
 
     conv1 = tf.layers.batch_normalization(inputs=conv1, training=training)
@@ -106,6 +109,7 @@ with tf.name_scope("Encoder"):
                              strides=(2, 2),
                              padding="same",
                              kernel_regularizer=regularizer,
+                             kernel_initializer=initializer,
                              name="conv2")
 
     conv2 = tf.layers.batch_normalization(inputs=conv2, training=training)
@@ -123,6 +127,7 @@ with tf.name_scope("Encoder"):
                                                       strides=(1, 1),
                                                       padding="same",
                                                       kernel_regularizer=regularizer,
+                                                      kernel_initializer=initializer,
                                                       name="conv"+str(6*i+2*j+3)))
 
             E_residual_blocks[-1] = tf.layers.batch_normalization(inputs=E_residual_blocks[-1], training=training)
@@ -134,6 +139,7 @@ with tf.name_scope("Encoder"):
                                                       strides=(1, 1),
                                                       padding="same",
                                                       kernel_regularizer=regularizer,
+                                                      kernel_initializer=initializer,
                                                       name="conv"+str(6*i+2*j+4)))
 
             tmp = E_residual_blocks[-1] + tmp2
@@ -146,6 +152,7 @@ with tf.name_scope("Encoder"):
                                               strides=(1, 1),
                                               padding="same",
                                               kernel_regularizer=regularizer,
+                                              kernel_initializer=initializer,
                                               name="conv"+str(depth*6+3)))
 
     E_residual_blocks[-1] = tf.layers.batch_normalization(inputs=E_residual_blocks[-1], training=training)
@@ -157,6 +164,7 @@ with tf.name_scope("Encoder"):
                                               strides=(1, 1),
                                               padding="same",
                                               kernel_regularizer=regularizer,
+                                              kernel_initializer=initializer,
                                               name="conv"+str(depth*6+4)))
 
     tmp = E_residual_blocks[-1] + tmp2 + conv2
@@ -167,6 +175,7 @@ with tf.name_scope("Encoder"):
                              strides=(2, 2),
                              padding="same",
                              kernel_regularizer=regularizer,
+                             kernel_initializer=initializer,
                              name="conv"+str(depth*6+5))
 
     z = tf.layers.conv3d(inputs=tf.expand_dims(e_out, axis=-1),
@@ -175,7 +184,10 @@ with tf.name_scope("Encoder"):
                          strides=(1, 1, 1),
                          padding="same",
                          kernel_regularizer=regularizer,
+                         kernel_initializer=initializer,
                          name="conv3d")
+
+    z_soft = tf.nn.softmax(z, axis=-1) # probability for each value to be every symbol
 
     y_out = tf.layers.conv2d(inputs=tmp,
                              filters=1,
@@ -184,25 +196,41 @@ with tf.name_scope("Encoder"):
                              padding="same",
                              #kernel_initializer=tf.constant_initializer(K),
                              kernel_regularizer=regularizer,
+                             kernel_initializer=initializer,
                              name="conv"+str(depth * 6 + 6))
 
-    y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
+    #y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
     #y_out = tf.nn.sigmoid(y_out)
 
 with tf.name_scope("Mask"):
 
-    y = tf.exp(y_out)
-    sum = tf.reshape(tf.reduce_sum(y, axis=[1, 2]), [-1, 1])
-    shape = tf.shape(y)
-    tile = tf.tile(sum, [1, shape[1] * shape[2]])
+    shape = tf.shape(y_out)
+
+    y_max = tf.reduce_max(tf.abs(y_out), axis=[1, 2])
+
+    tf.summary.scalar("Max_value_mask", tf.reduce_mean(y_max))
+
+    y_max_tile = tf.reshape(tf.tile(y_max, [1, shape[1] * shape[2]]), shape)
+
+    y = tf.exp(y_out / y_max_tile)
+    y_sum = tf.reshape(tf.reduce_sum(y, axis=[1, 2]), [-1, 1])
+    tile = tf.tile(y_sum, [1, shape[1] * shape[2]])
 
     y = tf.div(y, tf.reshape(tile, shape))
 
     tf.summary.image("prob", y, 5)
 
-    yy = tf.transpose(tf.reshape(tf.tile(tf.reshape(y, [-1]), [K]), [K, tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2]]), [1, 2, 3, 0])
-    kk = tf.transpose(tf.reshape(tf.tile(tf.linspace(0., K - 1, K), [np.prod(y.get_shape().as_list())]), [tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2], K]),
+    yy = tf.transpose(tf.reshape(tf.tile(tf.reshape(y,
+                                                    [-1]),
+                                         [K]),
+                                 [K, tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2]]),
+                      [1, 2, 3, 0])
+
+    kk = tf.transpose(tf.reshape(tf.tile(tf.linspace(0., K - 1, K),
+                                         [np.prod(y.get_shape().as_list())]),
+                                 [tf.shape(y)[0], tf.shape(y)[1], tf.shape(y)[2], K]),
                       [0, 1, 2, 3])
+
     m = yy * K - kk
     zero = tf.zeros(tf.shape(m))
     m = tf.maximum(x=m, y=zero)
@@ -214,11 +242,17 @@ with tf.name_scope("Mask"):
 
 with tf.name_scope("Quantizer"):
 
-    z_soft = tf.nn.softmax(z)
+    z_scaled = z * 1.
+
     z_hat = tf.cast(tf.argmax(z_soft, axis=-1) + 1, dtype=tf.float32)
 
-    cs = tf.cumsum(tf.ones_like(z_soft), axis=-1)
-    z_tilde = tf.reduce_sum(cs * tf.exp(beta * z_soft), axis=-1) / tf.reduce_sum(tf.exp(beta * z_soft), axis=-1)
+    cs = tf.cumsum(tf.ones_like(z), axis=-1)
+
+    z_soft_scaled = tf.nn.softmax((beta * z_scaled), axis=-1)
+    z_tilde = tf.reduce_sum((z_soft_scaled * cs), axis=-1)
+
+    quant_error = tf.reduce_mean(tf.abs(z_hat - z_tilde), axis=[0, 1, 2, 3])
+    tf.summary.scalar('Quantization_error', quant_error)
 
     z_differentiable = tf.stop_gradient(z_hat - z_tilde) + z_tilde
 
@@ -235,6 +269,7 @@ with tf.name_scope("Decoder"):
                                                         strides=(2, 2),
                                                         padding="same",
                                                         kernel_regularizer=regularizer,
+                                                        kernel_initializer=initializer,
                                                         name="conv"+str(depth*6+7)))
 
     D_residual_blocks[-1] = tf.layers.batch_normalization(inputs=D_residual_blocks[-1], training=training)
@@ -251,6 +286,7 @@ with tf.name_scope("Decoder"):
                                                       strides=(1, 1),
                                                       padding="same",
                                                       kernel_regularizer=regularizer,
+                                                      kernel_initializer=initializer,
                                                       name="conv"+str(6*i+2*j+depth*6+8)))
 
             D_residual_blocks[-1] = tf.layers.batch_normalization(inputs=D_residual_blocks[-1], training=training)
@@ -262,6 +298,7 @@ with tf.name_scope("Decoder"):
                                                       strides=(1, 1),
                                                       padding="same",
                                                       kernel_regularizer=regularizer,
+                                                      kernel_initializer=initializer,
                                                       name="conv"+str(6*i+2*j+depth*6+9)))
 
             tmp = D_residual_blocks[-1] + tmp2
@@ -274,6 +311,7 @@ with tf.name_scope("Decoder"):
                                               strides=(1, 1),
                                               padding="same",
                                               kernel_regularizer=regularizer,
+                                              kernel_initializer=initializer,
                                               name="conv"+str(depth*14+4)))
 
     D_residual_blocks[-1] = tf.layers.batch_normalization(inputs=D_residual_blocks[-1], training=training)
@@ -285,6 +323,7 @@ with tf.name_scope("Decoder"):
                                               strides=(1, 1),
                                               padding="same",
                                               kernel_regularizer=regularizer,
+                                              kernel_initializer=initializer,
                                               name="conv"+str(depth*14+5)))
 
     tmp = D_residual_blocks[-1] + tmp2 + D_residual_blocks[0]
@@ -295,6 +334,7 @@ with tf.name_scope("Decoder"):
                                          strides=(2, 2),
                                          padding="same",
                                          kernel_regularizer=regularizer,
+                                         kernel_initializer=initializer,
                                          name="deconv1")
 
     deconv1 = tf.layers.batch_normalization(inputs=deconv1, training=training)
@@ -305,13 +345,18 @@ with tf.name_scope("Decoder"):
                                          strides=(2, 2),
                                          padding="same",
                                          kernel_regularizer=regularizer,
+                                         kernel_initializer=initializer,
                                          name="deconv2")
 
-    deconv2 = tf.nn.sigmoid(deconv2) # images must be between 0 and 1
+    #deconv2 = tf.nn.sigmoid(deconv2) # images must be between 0 and 1
 
     # Output Decoder
 
-x_hat = deconv2
+x_hat = tf.minimum(tf.maximum(deconv2, 0.), 1.) # bounded ReLu
+
+relu_err = tf.reduce_mean(tf.abs(x_hat-deconv2), axis=[0, 1, 2, 3])
+
+tf.summary.scalar("Bounded_RELU_error", relu_err)
 
 
 # Denormalize Reconstructed Image
@@ -327,7 +372,7 @@ msssim_indexR = MSSSIM.tf_ms_ssim(x[:, :, :, 0:1], x_hat[:, :, :, 0:1])
 msssim_indexG = MSSSIM.tf_ms_ssim(x[:, :, :, 1:2], x_hat[:, :, :, 1:2])
 msssim_indexB = MSSSIM.tf_ms_ssim(x[:, :, :, 2:3], x_hat[:, :, :, 2:3])
 
-acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
+acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3.
 
 mse = tf.reduce_mean(tf.squared_difference(x, x_hat))
 
@@ -368,12 +413,12 @@ saver = tf.train.Saver()
 update = 0
 sess.run(training_init_op)
 for update in range(n_update):
-    _, summary = sess.run((train, merged), feed_dict={training: True})
+    _, summary = sess.run((train, merged), feed_dict={training: True, lr: learning_rate})
 
     train_writer.add_summary(summary, update)
 
     if update % 40000 == 39999:
-        lr = tf.assign(lr, lr * 0.1)
+        learning_rate *= 0.1
 
 try:
     saver.save(sess, "model/model.ckpt")
