@@ -1,6 +1,6 @@
 import tensorflow as tf
 import numpy as np
-#import MSSSIM
+import MSSSIM
 
 # reset graph
 tf.reset_default_graph()
@@ -58,7 +58,7 @@ n_update = 20000 * 6
 
 sigma = tf.constant(1.)
 depth = 5 # Depth residual block for the AutoEncoder
-lr = tf.Variable(1e-5) # Learning rate
+lr = tf.Variable(1e-4) # Learning rate
 regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regulapa/ui/rization term for all layers
 regularizer2 = tf.contrib.layers.l2_regularizer(scale=0.1)  # Regularization term for layer that outputs y
 image_height = 160
@@ -186,8 +186,8 @@ with tf.name_scope("Encoder"):
                              kernel_regularizer=regularizer,
                              name="conv"+str(depth * 6 + 6))
 
-    #y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
-    y_out = tf.nn.sigmoid(y_out)
+    y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
+    #y_out = tf.nn.sigmoid(y_out)
 
 with tf.name_scope("Mask"):
 
@@ -323,17 +323,17 @@ tf.summary.image("x", x, 5)
 tf.summary.image("x_hat", x_hat, 5)
 
 # Distortion rate index
-# msssim_indexR = tf_ms_ssim(x[:, :, :, 0:1], x_hat_norm[:, :, :, 0:1])
-# msssim_indexG = tf_ms_ssim(x[:, :, :, 1:2], x_hat_norm[:, :, :, 1:2])
-# msssim_indexB = tf_ms_ssim(x[:, :, :, 2:3], x_hat_norm[:, :, :, 2:3])
-#
-# acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
+msssim_indexR = MSSSIM.tf_ms_ssim(x[:, :, :, 0:1], x_hat[:, :, :, 0:1])
+msssim_indexG = MSSSIM.tf_ms_ssim(x[:, :, :, 1:2], x_hat[:, :, :, 1:2])
+msssim_indexB = MSSSIM.tf_ms_ssim(x[:, :, :, 2:3], x_hat[:, :, :, 2:3])
+
+acc = (msssim_indexR + msssim_indexG + msssim_indexB) / 3
 
 mse = tf.reduce_mean(tf.squared_difference(x, x_hat))
 
 loss = mse
 
-acc = (1. - mse)
+#acc = (1. - mse)
 
 tf.summary.scalar('accuracy', acc*100.)
 tf.summary.scalar('loss', loss)
