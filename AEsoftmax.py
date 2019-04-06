@@ -59,15 +59,15 @@ n_update = 20000 * 6
 #sigma = tf.constant(1.)
 depth = 5 # Depth residual block for the AutoEncoder
 learning_rate = 1e-4 # Learning rate
-regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regulapa/ui/rization term for all layers
+regularizer = tf.contrib.layers.l2_regularizer(scale=0.01)  # Regularization term for all layers
 regularizer2 = tf.contrib.layers.l2_regularizer(scale=0.1)  # Regularization term for layer that outputs y
-initializer = tf.initializers.he_normal()
+initializer = None #tf.initializers.he_normal()
 image_height = 160
 image_width = 160
 
-beta = 100
+beta = 1000
 
-K = 1024
+K = 128
 L = 64
 
 # Graph definition ------------------------------------------------------------------------------------------------------------------
@@ -194,10 +194,15 @@ with tf.name_scope("Encoder"):
                              kernel_size=[5, 5],
                              strides=(2, 2),
                              padding="same",
-                             #kernel_initializer=tf.constant_initializer(K),
-                             kernel_regularizer=regularizer,
+                             kernel_regularizer=regularizer2,
                              kernel_initializer=initializer,
                              name="conv"+str(depth * 6 + 6))
+
+    weights_y = tf.get_default_graph().get_tensor_by_name("conv"+str(depth * 6 + 6)+"/kernel:0")
+
+    mean_w = tf.reduce_mean(tf.abs(weights_y), [0, 1, 2, 3])
+
+    tf.summary.scalar("y_out_weights_mean", mean_w)
 
     #y_out = tf.layers.batch_normalization(inputs=y_out, training=training)
     #y_out = tf.nn.sigmoid(y_out)
@@ -207,12 +212,19 @@ with tf.name_scope("Mask"):
     shape = tf.shape(y_out)
 
     y_max = tf.reduce_max(tf.abs(y_out), axis=[1, 2])
+    y_mean = tf.reduce_mean(tf.abs(y_out), axis=[1, 2])
 
     tf.summary.scalar("Max_value_mask", tf.reduce_mean(y_max))
+    tf.summary.scalar("Mean_value_mask", tf.reduce_mean(y_mean))
 
     y_max_tile = tf.reshape(tf.tile(y_max, [1, shape[1] * shape[2]]), shape)
 
     y = tf.exp(y_out / y_max_tile)
+
+    y_exp_mean = tf.reduce_mean(tf.abs(y), axis=[1, 2])
+
+    tf.summary.scalar("Mean_value_y_exp", tf.reduce_mean(y_exp_mean))
+
     y_sum = tf.reshape(tf.reduce_sum(y, axis=[1, 2]), [-1, 1])
     tile = tf.tile(y_sum, [1, shape[1] * shape[2]])
 
